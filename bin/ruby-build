@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-RUBY_BUILD_VERSION="20131008"
+RUBY_BUILD_VERSION="20131030"
 
 set -E
 exec 3<&2 # preserve original stderr at fd 3
@@ -94,6 +94,17 @@ file_is_not_empty() {
   else
     return 1
   fi
+}
+
+num_cpu_cores() {
+  local num=""
+  if [ "Darwin" = "$(uname -s)" ]; then
+    num="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+  elif [ -r /proc/cpuinfo ]; then
+    num="$(grep -c ^processor /proc/cpuinfo)"
+    [ "$num" -gt 0 ] || num=""
+  fi
+  echo "${num:-2}"
 }
 
 install_package() {
@@ -236,21 +247,22 @@ fetch_tarball() {
     fi
   fi
 
-  local xbase=${package_url##*/}
-  local xfext=${xbase##*.}
-  local xpref=${xbase%.*}
+  local tar_args="xzvf"
+  local package_filename="${package_name}.tar.gz"
 
-  local package_filename=$xpref.$xfext
+  if [ "$package_url" != "${package_url%bz2}" ]; then
+    package_filename="${package_filename%.gz}.bz2"
+    tar_args="${tar_args/z/j}"
+  fi
 
-  symlink_tarball_from_cache "$package_filename" "$checksum" || {
+  if ! symlink_tarball_from_cache "$package_filename" "$checksum"; then
     echo "Downloading ${package_filename}..." >&2
-    { http head "$mirror_url" &&
-      download_tarball "$mirror_url" "$package_filename" "$checksum"
-    } ||
+    http head "$mirror_url" &&
+    download_tarball "$mirror_url" "$package_filename" "$checksum" ||
     download_tarball "$package_url" "$package_filename" "$checksum"
-  }
+  fi
 
-  { if tar xzvf "$package_filename"; then
+  { if tar $tar_args "$package_filename"; then
       if [ -z "$KEEP_BUILD_PATH" ]; then
         rm -f "$package_filename"
       else
@@ -287,9 +299,12 @@ download_tarball() {
 
   echo "-> $package_url" >&2
 
-  { http get "$package_url" "$package_filename"
-    verify_checksum "$package_filename" "$checksum"
-  } >&4 2>&1 || return 1
+  if http get "$package_url" "$package_filename" >&4 2>&1; then
+    verify_checksum "$package_filename" "$checksum" >&4 2>&1 || return 1
+  else
+    echo "error: failed to download $package_filename" >&2
+    return 1
+  fi
 
   if [ -n "$RUBY_BUILD_CACHE_PATH" ]; then
     local cached_package_filename="${RUBY_BUILD_CACHE_PATH}/$package_filename"
@@ -376,7 +391,7 @@ build_package_standard() {
   if [ "${MAKEOPTS+defined}" ]; then
     MAKE_OPTS="$MAKEOPTS"
   elif [ -z "${MAKE_OPTS+defined}" ]; then
-    MAKE_OPTS="-j 2"
+    MAKE_OPTS="-j $(num_cpu_cores)"
   fi
 
   # Support YAML_CONFIGURE_OPTS, RUBY_CONFIGURE_OPTS, etc.
@@ -413,19 +428,15 @@ build_package_ruby() {
 }
 
 build_package_ree_installer() {
+  build_package_auto_tcltk
+
   local options=""
   if [[ "Darwin" = "$(uname)" ]]; then
     options="--no-tcmalloc"
-
-    # Some versions of REE mistakenly detect Tk support
-    # on OS X even though X11 is not installed.
-    if [ ! -d "/usr/include/X11" ]; then
-      options="$options -c --without-tk"
-    fi
   fi
 
   local option
-  for option in $RUBY_CONFIGURE_OPTS; do
+  for option in $RUBY_CONFIGURE_OPTS ${RUBY_CONFIGURE_OPTS_ARRAY[@]}; do
     options="$options -c $option"
   done
 
@@ -439,9 +450,10 @@ build_package_ree_installer() {
 build_package_rbx() {
   local package_name="$1"
 
-  { bundle
+  { bundle --path=vendor/bundle
     ./configure --prefix="$PREFIX_PATH" $RUBY_CONFIGURE_OPTS
     rake install
+    fix_rbx_gem_binstubs "$PREFIX_PATH"
   } >&4 2>&1
 }
 
@@ -450,7 +462,7 @@ build_package_mruby() {
 
   { rake
     mkdir -p "$PREFIX_PATH"
-    cp -R build/host/* "$PREFIX_PATH"
+    cp -fR build/host/* "$PREFIX_PATH"
     cd "$PREFIX_PATH/bin"
     ln -fs mruby ruby
     ln -fs mirb irb
@@ -511,7 +523,7 @@ remove_windows_files() {
 
 build_package_copy() {
   mkdir -p "$PREFIX_PATH"
-  cp -R . "$PREFIX_PATH"
+  cp -fR . "$PREFIX_PATH"
 }
 
 before_install_package() {
@@ -525,6 +537,20 @@ after_install_package() {
 fix_directory_permissions() {
   # Ensure installed directories are not world-writable to avoid Bundler warnings
   find "$PREFIX_PATH" -type d \( -perm -020 -o -perm -002 \) -exec chmod go-w {} \;
+}
+
+fix_rbx_gem_binstubs() {
+  local prefix="$1"
+  local gemdir="${prefix}/gems/bin"
+  local bindir="${prefix}/bin"
+  # Symlink Rubinius' `gems/bin/` into `bin/`
+  if [ -d "$gemdir" ]; then
+    for file in "$gemdir"/*; do
+      [ -x "$file" ] && mv "$file" "$bindir"
+    done
+    rm -rf "$gemdir"
+    ln -s ../bin "$gemdir"
+  fi
 }
 
 require_gcc() {
@@ -618,6 +644,20 @@ verify_gcc() {
   echo "$gcc"
 }
 
+needs_yaml() {
+  [[ "$RUBY_CONFIGURE_OPTS" != *--with-libyaml-dir=* ]] &&
+  ! use_homebrew_yaml
+}
+
+use_homebrew_yaml() {
+  local libdir="$(brew --prefix libyaml 2>/dev/null || true)"
+  if [ -d "$libdir" ]; then
+    package_option ruby configure --with-libyaml-dir="$libdir"
+  else
+    return 1
+  fi
+}
+
 has_broken_mac_openssl() {
   [ "$(uname -s)" = "Darwin" ] &&
   [[ "$(openssl version 2>/dev/null || true)" = "OpenSSL 0.9.8"?* ]] &&
@@ -670,6 +710,58 @@ build_package_verify_openssl() {
   rescue LoadError
     abort "The Ruby openssl extension was not compiled. Missing the OpenSSL lib?"
   end' >&4 2>&1
+}
+
+# Ensure that directories listed in LDFLAGS exist
+build_package_ldflags_dirs() {
+  local arg
+  for arg in $LDFLAGS; do
+    case "$arg" in
+    -L* ) mkdir -p "${arg#-L}" ;;
+    esac
+  done
+}
+
+build_package_auto_tcltk() {
+  if [ "Darwin" = "$(uname -s)" ] && [ ! -d /usr/include/X11 ]; then
+    if [ -d /opt/X11/include ]; then
+      if [[ "$CPPFLAGS" != *-I/opt/X11/include* ]]; then
+        export CPPFLAGS="-I/opt/X11/include $CPPFLAGS"
+      fi
+    else
+      package_option ruby configure --without-tk
+    fi
+  fi
+}
+
+rake() {
+  if [ -e "./Gemfile" ]; then
+    bundle exec rake "$@"
+  else
+    isolated_gem_dependency "rake --version" rake -v '~> 10.1.0'
+    command rake "$@"
+  fi
+}
+
+bundle() {
+  isolated_gem_dependency "bundle --version" bundler -v '~> 1.3.5'
+  command bundle "$@"
+}
+
+isolated_gem_dependency() {
+  set +E
+  ( command $1 &>/dev/null ) || {
+    set -E
+    shift 1
+    isolated_gem_install "$@"
+  }
+  set -E
+}
+
+isolated_gem_install() {
+  export GEM_HOME="${PWD}/.gem"
+  export PATH="${GEM_HOME}/bin:${PATH}"
+  gem install "$@"
 }
 
 version() {
@@ -747,12 +839,19 @@ fi
 PREFIX_PATH="${ARGUMENTS[1]}"
 if [ -z "$PREFIX_PATH" ]; then
   usage
+elif [ "${PREFIX_PATH#/}" = "$PREFIX_PATH" ]; then
+  PREFIX_PATH="${PWD}/${PREFIX_PATH}"
 fi
 
 if [ -z "$TMPDIR" ]; then
   TMP="/tmp"
 else
   TMP="${TMPDIR%/}"
+fi
+
+if [ ! -w "$TMP" ] || [ ! -x "$TMP" ]; then
+  echo "ruby-build: TMPDIR=$TMP is set to a non-accessible location" >&2
+  exit 1
 fi
 
 # Work around warnings building Ruby 2.0 on Clang 2.x:
@@ -766,7 +865,11 @@ if "${CC:-cc}" -x c /dev/null -E -Wno-error=shorten-64-to-32 &>/dev/null; then
 fi
 
 if [ -z "$MAKE" ]; then
-  export MAKE="make"
+  if [[ "FreeBSD" = "$(uname -s)" ]]; then
+    export MAKE="gmake"
+  else
+    export MAKE="make"
+  fi
 fi
 
 if [ -n "$RUBY_BUILD_CACHE_PATH" ] && [ -d "$RUBY_BUILD_CACHE_PATH" ]; then
@@ -810,8 +913,8 @@ if [ -n "$VERBOSE" ]; then
   trap "kill $TAIL_PID" SIGINT SIGTERM EXIT
 fi
 
-export LDFLAGS="-L'${PREFIX_PATH}/lib' ${LDFLAGS}"
-export CPPFLAGS="-I'${PREFIX_PATH}/include' ${CPPFLAGS}"
+export LDFLAGS="-L${PREFIX_PATH}/lib ${LDFLAGS}"
+export CPPFLAGS="-I${PREFIX_PATH}/include ${CPPFLAGS}"
 
 unset RUBYOPT
 unset RUBYLIB
